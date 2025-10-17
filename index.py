@@ -6,6 +6,31 @@ import requests
 from datetime import datetime, timedelta
 import pytz
 
+
+# ==============================
+# Load CSV Data
+# ==============================
+def load_nifty_csv(file_path):
+    """
+    Reads NIFTY CSV data, parses datetime, and formats it for backtesting.
+    Handles both timezone-aware and naive datetimes.
+    """
+    df = pd.read_csv(file_path)
+
+    # Parse datetime
+    df["datetime"] = pd.to_datetime(df["date"], utc=True)
+
+    # Convert to IST (Asia/Kolkata)
+    df["datetime"] = df["datetime"].dt.tz_convert('Asia/Kolkata')
+
+    # Keep only required columns
+    df = df[["datetime", "open", "high", "low", "close"]].copy()
+
+    # Reset index
+    df = df.reset_index(drop=True)
+
+    return df
+
 # ==============================
 # Data Fetching
 # ==============================
@@ -301,7 +326,10 @@ def main():
         "tp_multiplier": 3.5
     }
 
-    df = fetch_nifty_data(interval=5, days_back=90)
+    # df = fetch_nifty_data(interval=5, days_back=90)
+    load_nifty_csv_path = "NIFTY50-5.csv"  
+    df = load_nifty_csv(load_nifty_csv_path)
+
     results = find_marked_candles(df, **params)
 
     # Analysis Parameters Table
