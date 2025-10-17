@@ -1,12 +1,16 @@
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from tabulate import tabulate
 import requests
 from datetime import datetime, timedelta
 import pytz
 
-# === Fetch Data ===
+# ==============================
+# Data Fetching
+# ==============================
 def fetch_nifty_data(interval=5, days_back=30):
+    """Fetch NIFTY 50 historical data from Groww API."""
     ist = pytz.timezone('Asia/Kolkata')
     now_ist = datetime.now(ist)
     start_time_ist = now_ist - timedelta(days=days_back)
@@ -22,90 +26,80 @@ def fetch_nifty_data(interval=5, days_back=30):
 
     df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df.drop(columns=["volume"], inplace=True)
-    df["datetime"] = pd.to_datetime(df["timestamp"], unit="s").dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
+    df["datetime"] = pd.to_datetime(df["timestamp"], unit="s")\
+                      .dt.tz_localize('UTC')\
+                      .dt.tz_convert('Asia/Kolkata')
     return df.reset_index(drop=True)
 
-
-# === Swing Detection (matches Pine Script logic) ===
+# ==============================
+# Swing Detection
+# ==============================
 def detect_swing(df, start_idx, end_idx, swing_threshold):
-    length = end_idx - start_idx + 1
-    if length <= 0:
+    """Detects if a swing exists between start_idx and end_idx."""
+    if end_idx - start_idx + 1 <= 0:
         return False
 
-    swing_high = df.loc[start_idx, "low"]
-    swing_low = df.loc[start_idx, "high"]
-
-    for i in range(start_idx, end_idx + 1):
-        swing_high = max(swing_high, df.loc[i, "high"])
-        swing_low = min(swing_low, df.loc[i, "low"])
-
+    swing_high = max(df.loc[start_idx:end_idx, "high"])
+    swing_low = min(df.loc[start_idx:end_idx, "low"])
     return (swing_high - swing_low) > swing_threshold
 
-
-# === Main Candle Detection (forward iteration) ===
-def find_marked_candles(df, u_wick_threshold, l_wick_threshold, buffer_window, wick_diff, st, stt):
-    # Calculate wick sizes
+# ==============================
+# Candle Detection
+# ==============================
+def find_marked_candles(df, u_wick_threshold, l_wick_threshold, buffer_window, wick_diff, st, stt, sl_buffer, tp_multiplier):
+    """Identify marked and trigger candles."""
     df["upper_wick"] = df["high"] - df[["open", "close"]].max(axis=1)
     df["lower_wick"] = df[["open", "close"]].min(axis=1) - df["low"]
 
-    # Containers
     mark_up, test_up, trigger_up, mark_up_dup = [], [], [], []
     mark_dn, test_dn, trigger_dn, mark_dn_dup = [], [], [], []
 
-    # Iterate forward through candles
     for i in range(len(df)):
-        upper_wick = df.loc[i, "upper_wick"]
-        lower_wick = df.loc[i, "lower_wick"]
-
-        # --- Detect Marked Candles (UP) ---
-        if upper_wick >= u_wick_threshold:
+        # --- Mark Up Candles ---
+        if df.loc[i, "upper_wick"] >= u_wick_threshold:
             for j in range(i + 1, len(df)):
                 diff = df.loc[j, "high"] - df.loc[i, "high"]
                 if diff > 0:
                     break
-                elif abs(diff) <= wick_diff and j >= i + buffer_window:
-                    upper_wick_j = df.loc[j, "high"] - max(df.loc[j, "open"], df.loc[j, "close"])
-                    if upper_wick_j >= u_wick_threshold:
+                if abs(diff) <= wick_diff and j >= i + buffer_window:
+                    if df.loc[j, "high"] - max(df.loc[j, "open"], df.loc[j, "close"]) >= u_wick_threshold:
                         if detect_swing(df, i, j, st):
                             mark_up.append(j)
                             test_up.append(i)
 
-        # --- Detect Marked Candles (DOWN) ---
-        if lower_wick >= l_wick_threshold:
+        # --- Mark Down Candles ---
+        if df.loc[i, "lower_wick"] >= l_wick_threshold:
             for j in range(i + 1, len(df)):
                 diff = df.loc[i, "low"] - df.loc[j, "low"]
                 if diff > 0:
                     break
-                elif abs(diff) <= wick_diff and j >= i + buffer_window:
-                    lower_wick_j = min(df.loc[j, "open"], df.loc[j, "close"]) - df.loc[j, "low"]
-                    if lower_wick_j >= l_wick_threshold:
+                if abs(diff) <= wick_diff and j >= i + buffer_window:
+                    if min(df.loc[j, "open"], df.loc[j, "close"]) - df.loc[j, "low"] >= l_wick_threshold:
                         if detect_swing(df, i, j, st):
                             mark_dn.append(j)
                             test_dn.append(i)
 
-    # --- Find Trigger Candles (UP) ---
-    for idx in mark_up:
-        for j in range(idx + 1, len(df)):
-            diff = df.loc[j, "high"] - df.loc[idx, "high"]
-            if diff > 0 and j < idx + buffer_window:
-                break
-            elif diff > 0 and j >= idx + buffer_window:
-                if detect_swing(df, idx, j, stt):
-                    trigger_up.append(j)
-                    mark_up_dup.append(idx)
-                break
+    # --- Trigger Candles ---
+    def find_trigger(mark_list, buffer_window, stt, direction="up"):
+        trigger, mark_dup = [], []
+        for idx in mark_list:
+            for j in range(idx + 1, len(df)):
+                if direction == "up":
+                    diff = df.loc[j, "high"] - df.loc[idx, "high"]
+                else:
+                    diff = df.loc[idx, "low"] - df.loc[j, "low"]
 
-    # --- Find Trigger Candles (DOWN) ---
-    for idx in mark_dn:
-        for j in range(idx + 1, len(df)):
-            diff = df.loc[idx, "low"] - df.loc[j, "low"]
-            if diff > 0 and j < idx + buffer_window:
-                break
-            elif diff > 0 and j >= idx + buffer_window:
-                if detect_swing(df, idx, j, stt):
-                    trigger_dn.append(j)
-                    mark_dn_dup.append(idx)
-                break
+                if diff > 0 and j < idx + buffer_window:
+                    break
+                if diff > 0 and j >= idx + buffer_window:
+                    if detect_swing(df, idx, j, stt):
+                        trigger.append(j)
+                        mark_dup.append(idx)
+                    break
+        return trigger, mark_dup
+
+    trigger_up, mark_up_dup = find_trigger(mark_up, buffer_window, stt, "up")
+    trigger_dn, mark_dn_dup = find_trigger(mark_dn, buffer_window, stt, "down")
 
     return {
         "mark_candles_up": mark_up_dup,
@@ -116,134 +110,224 @@ def find_marked_candles(df, u_wick_threshold, l_wick_threshold, buffer_window, w
         "trigger_candles_down": trigger_dn
     }
 
-
-# === Visualization ===
-def plot_candlestick_with_marks(df, results):
-    plt.figure(figsize=(15, 8))
-    for i in range(len(df)):
-        color = 'green' if df.loc[i, "close"] >= df.loc[i, "open"] else 'red'
-        plt.plot([i, i], [df.loc[i, "low"], df.loc[i, "high"]], color='black', linewidth=1)
-        plt.plot([i, i], [df.loc[i, "open"], df.loc[i, "close"]], color=color, linewidth=3)
-
-    # Plot markers
-    if results["mark_candles_up"]:
-        plt.scatter(results["mark_candles_up"], df.loc[results["mark_candles_up"], "low"] - 5,
-                    marker="^", color="orange", s=80, label="Mark Up")
-    if results["trigger_candles_up"]:
-        plt.scatter(results["trigger_candles_up"], df.loc[results["trigger_candles_up"], "low"] - 8,
-                    marker="^", color="green", s=80, label="Trigger Up")
-    if results["mark_candles_down"]:
-        plt.scatter(results["mark_candles_down"], df.loc[results["mark_candles_down"], "high"] + 5,
-                    marker="v", color="orange", s=80, label="Mark Down")
-    if results["trigger_candles_down"]:
-        plt.scatter(results["trigger_candles_down"], df.loc[results["trigger_candles_down"], "high"] + 8,
-                    marker="v", color="red", s=80, label="Trigger Down")
-
-    plt.title("NIFTY Marked Candles (Forward Iteration Python Replica)")
-    plt.xlabel("Bar Index")
-    plt.ylabel("Price")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
-
-
-# === Backtesting with Swing-based SL ===
+# ==============================
+# Backtesting
+# ==============================
 def backtest_strategy_swing_sl(df, results, sl_buffer, tp_multiplier):
     trades = []
 
-    # Long trades (trigger up)
+    # --- Long Trades ---
     for idx, mark_idx in zip(results["trigger_candles_up"], results["mark_candles_up"]):
-        entry_price = df.loc[idx, "close"]
-        sl_price = df.loc[mark_idx, "low"]  # last swing low
-        tp_price = entry_price + tp_multiplier * (entry_price - sl_price)
-
+        entry, sl = df.loc[idx, "close"], df.loc[mark_idx, "low"]
+        tp = entry + tp_multiplier * (entry - sl)
         trade_outcome = None
         for j in range(idx + 1, len(df)):
-            high = df.loc[j, "high"]
-            low = df.loc[j, "low"]
-
-            if low < sl_price - sl_buffer:  # stop-loss hit
-                trade_outcome = sl_price - entry_price
+            if df.loc[j, "low"] < sl - sl_buffer:
+                trade_outcome = sl - entry
                 break
-            elif high >= tp_price:  # take-profit hit
-                trade_outcome = tp_price - entry_price
+            elif df.loc[j, "high"] >= tp:
+                trade_outcome = tp - entry
                 break
+        trades.append(trade_outcome if trade_outcome is not None else df.loc[len(df)-1, "close"] - entry)
 
-        if trade_outcome is None:
-            trade_outcome = df.loc[len(df) - 1, "close"] - entry_price
-
-        trades.append(trade_outcome)
-
-    # Short trades (trigger down)
+    # --- Short Trades ---
     for idx, mark_idx in zip(results["trigger_candles_down"], results["mark_candles_down"]):
-        entry_price = df.loc[idx, "close"]
-        sl_price = df.loc[mark_idx, "high"]  # last swing high
-        tp_price = entry_price - tp_multiplier * (sl_price - entry_price)
-
+        entry, sl = df.loc[idx, "close"], df.loc[mark_idx, "high"]
+        tp = entry - tp_multiplier * (sl - entry)
         trade_outcome = None
         for j in range(idx + 1, len(df)):
-            high = df.loc[j, "high"]
-            low = df.loc[j, "low"]
-
-            if high > sl_price + sl_buffer:  # stop-loss hit
-                trade_outcome = entry_price - sl_price
+            if df.loc[j, "high"] > sl + sl_buffer:
+                trade_outcome = entry - sl
                 break
-            elif low <= tp_price:  # take-profit hit
-                trade_outcome = entry_price - tp_price
+            elif df.loc[j, "low"] <= tp:
+                trade_outcome = entry - tp
                 break
+        trades.append(trade_outcome if trade_outcome is not None else entry - df.loc[len(df)-1, "close"])
 
-        if trade_outcome is None:
-            trade_outcome = entry_price - df.loc[len(df) - 1, "close"]
-
-        trades.append(trade_outcome)
-
-    # Evaluation
     trades = np.array(trades)
-    total_trades = len(trades)
-    wins = np.sum(trades > 0)
-    losses = np.sum(trades <= 0)
-    win_rate = wins / total_trades * 100 if total_trades > 0 else 0
-    total_pnl = trades.sum()
-    avg_pnl = total_pnl / total_trades if total_trades > 0 else 0
+    total_trades, wins, losses = len(trades), np.sum(trades>0), np.sum(trades<=0)
+    win_rate = round(wins / total_trades * 100, 2) if total_trades else 0
+    total_pnl = round(trades.sum(), 2)
+    avg_pnl = round(total_pnl / total_trades, 2) if total_trades else 0
 
-    print("--------------------------------------")
-    print(f"Total Trades: {total_trades}")
-    print(f"Wins: {wins}, Losses: {losses}, Win Rate: {win_rate:.2f}%")
-    print(f"Total P&L: {round(total_pnl, 2)}")
-    print(f"P&L per Trade: {round(avg_pnl, 2)}")
-    print(f"Risk-Reward Ratio: {tp_multiplier}:1")
+    summary_df = pd.DataFrame([{
+        "Total Trades": total_trades,
+        "Wins": wins,
+        "Losses": losses,
+        "Win Rate (%)": win_rate,
+        "Total P&L": total_pnl,
+        "P&L per Trade": avg_pnl,
+        "Risk-Reward Ratio": f"{tp_multiplier}:1"
+    }])
+
+    print("\nBacktest Summary:")
+    print(tabulate(summary_df, headers='keys', tablefmt='fancy_grid', showindex=False))
 
     return trades
 
+# ==============================
+# Display Mark ↔ Trigger Candle Table
+# ==============================
+def print_marked_trigger_table(df, results):
+    data = []
+    for direction, mark_list, trigger_list in [("Up", results["mark_candles_up"], results["trigger_candles_up"]),
+                                               ("Down", results["mark_candles_down"], results["trigger_candles_down"])]:
+        for mark_idx, trigger_idx in zip(mark_list, trigger_list):
+            data.append({
+                "Type": direction,
+                "Mark Candle Datetime": df.loc[mark_idx, "datetime"],
+                "Trigger Candle Datetime": df.loc[trigger_idx, "datetime"],
+                "Mark Candle Index": mark_idx,
+                "Trigger Candle Index": trigger_idx
+            })
+
+    table_df = pd.DataFrame(data).sort_values("Mark Candle Datetime").reset_index(drop=True)
+    print("\nMarked Candle ↔ Trigger Candle Table:")
+    print(tabulate(table_df, headers='keys', tablefmt='fancy_grid'))
+
+
+# # === Visualization ===
+# def plot_candlestick_with_marks(df, results):
+#     plt.figure(figsize=(15, 8))
+#     for i in range(len(df)):
+#         color = 'green' if df.loc[i, "close"] >= df.loc[i, "open"] else 'red'
+#         plt.plot([i, i], [df.loc[i, "low"], df.loc[i, "high"]], color='black', linewidth=1)
+#         plt.plot([i, i], [df.loc[i, "open"], df.loc[i, "close"]], color=color, linewidth=3)
+
+#     # Plot markers
+#     if results["mark_candles_up"]:
+#         plt.scatter(results["mark_candles_up"], df.loc[results["mark_candles_up"], "low"] - 5,
+#                     marker="^", color="orange", s=80, label="Mark Up")
+#     if results["trigger_candles_up"]:
+#         plt.scatter(results["trigger_candles_up"], df.loc[results["trigger_candles_up"], "low"] - 8,
+#                     marker="^", color="green", s=80, label="Trigger Up")
+#     if results["mark_candles_down"]:
+#         plt.scatter(results["mark_candles_down"], df.loc[results["mark_candles_down"], "high"] + 5,
+#                     marker="v", color="orange", s=80, label="Mark Down")
+#     if results["trigger_candles_down"]:
+#         plt.scatter(results["trigger_candles_down"], df.loc[results["trigger_candles_down"], "high"] + 8,
+#                     marker="v", color="red", s=80, label="Trigger Down")
+
+#     plt.title("NIFTY Marked Candles (Forward Iteration Python Replica)")
+#     plt.xlabel("Bar Index")
+#     plt.ylabel("Price")
+#     plt.legend()
+#     plt.grid(True)
+#     plt.tight_layout()
+#     plt.show()
+
+def plot_candlestick_with_marks_plotly(df, results):
+    fig = go.Figure()
+
+    # Add candlestick
+    fig.add_trace(go.Candlestick(
+        x=df["datetime"],
+        open=df["open"],
+        high=df["high"],
+        low=df["low"],
+        close=df["close"],
+        increasing_line_color='green',
+        decreasing_line_color='red',
+        name='Price'
+    ))
+
+    # Add Mark Up candles
+    if results["mark_candles_up"]:
+        fig.add_trace(go.Scatter(
+            x=df.loc[results["mark_candles_up"], "datetime"],
+            y=df.loc[results["mark_candles_up"], "low"] - 5,
+            mode='markers',
+            marker=dict(symbol='triangle-up', color='orange', size=12),
+            name='Mark Up'
+        ))
+
+    # Add Trigger Up candles
+    if results["trigger_candles_up"]:
+        fig.add_trace(go.Scatter(
+            x=df.loc[results["trigger_candles_up"], "datetime"],
+            y=df.loc[results["trigger_candles_up"], "low"] - 8,
+            mode='markers',
+            marker=dict(symbol='triangle-up', color='green', size=12),
+            name='Trigger Up'
+        ))
+
+    # Add Mark Down candles
+    if results["mark_candles_down"]:
+        fig.add_trace(go.Scatter(
+            x=df.loc[results["mark_candles_down"], "datetime"],
+            y=df.loc[results["mark_candles_down"], "high"] + 5,
+            mode='markers',
+            marker=dict(symbol='triangle-down', color='orange', size=12),
+            name='Mark Down'
+        ))
+
+    # Add Trigger Down candles
+    if results["trigger_candles_down"]:
+        fig.add_trace(go.Scatter(
+            x=df.loc[results["trigger_candles_down"], "datetime"],
+            y=df.loc[results["trigger_candles_down"], "high"] + 8,
+            mode='markers',
+            marker=dict(symbol='triangle-down', color='red', size=12),
+            name='Trigger Down'
+        ))
+
+    # Layout customization
+    fig.update_layout(
+        title='NIFTY Marked Candles (Interactive)',
+        xaxis_title='Datetime',
+        yaxis_title='Price',
+        xaxis_rangeslider_visible=False,
+        template='plotly_dark',
+        height=600
+    )
+
+    fig.show()
 
 
 
-# === Run Backtest ===
+# ==============================
+# Main
+# ==============================
 def main():
-    u_wick_threshold = 4
-    l_wick_threshold = 4
-    buffer_window = 4
-    wick_diff = 3.5
-    st = 30
-    stt = 15
+    # Parameters
+    params = {
+        "u_wick_threshold": 4,
+        "l_wick_threshold": 4,
+        "buffer_window": 4,
+        "wick_diff": 3.5,
+        "st": 30,
+        "stt": 15,
+        "sl_buffer": 20,
+        "tp_multiplier": 3.5
+    }
 
     df = fetch_nifty_data(interval=5, days_back=90)
-    results = find_marked_candles(df, u_wick_threshold, l_wick_threshold, buffer_window, wick_diff, st, stt)
-    print("Analysis Result over past 90 days @ 5-min Nifty 50 spot, parameters:")
-    print(f"Upper Wick Threshold: {u_wick_threshold}, Lower Wick Threshold: {l_wick_threshold}")
-    print(f"Buffer Window: {buffer_window}, Wick Difference: {wick_diff}, Swing Thresholds: {st}, {stt}")
-    
-    print(f"Mark Up: {len(results['mark_candles_up'])}, Trigger Up: {len(results['trigger_candles_up'])}")
-    print(f"Mark Down: {len(results['mark_candles_down'])}, Trigger Down: {len(results['trigger_candles_down'])}")
+    results = find_marked_candles(df, **params)
+
+    # Analysis Parameters Table
+    param_table = [[k.replace("_"," ").title(), v] for k,v in params.items()]
+    print("\nAnalysis Parameters (Past 90 days, 5-min Nifty 50 spot):")
+    print(tabulate(param_table, headers=["Parameter","Value"], tablefmt="fancy_grid"))
+
+    # Marked Candles Summary
+    print("\nMarked Candles Summary:")
+    print(tabulate([
+        ["Trigger Up", len(results['trigger_candles_up'])],
+        ["Trigger Down", len(results['trigger_candles_down'])]
+    ], headers=["Type","Count"], tablefmt="fancy_grid"))
+
+    # Backtest
+    backtest_strategy_swing_sl(df, results, sl_buffer=params["sl_buffer"], tp_multiplier=params["tp_multiplier"])
+
+    # Detailed Mark ↔ Trigger Table
+    print_marked_trigger_table(df, results)
+
 
     # plot_candlestick_with_marks(df, results)
-
-    trades = backtest_strategy_swing_sl(df, results, sl_buffer=20, tp_multiplier=3.5)
+    plot_candlestick_with_marks_plotly(df, results)
 
 if __name__ == "__main__":
     main()
-
 
 
 # ==============================
@@ -256,3 +340,5 @@ if __name__ == "__main__":
 # future_df = pd.DataFrame(future_data, columns=["timestamp", "open", "high", "low", "close", "volume"])
 # future_df["datetime"] = pd.to_datetime(future_df["timestamp"], unit="s").dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
 # future_df = future_df[["datetime", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
+
+# ==============================
